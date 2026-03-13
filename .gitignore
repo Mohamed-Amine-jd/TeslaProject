@@ -1,0 +1,18 @@
+# Maven
+target/
+*.class
+*.jar
+*.war
+
+# IntelliJ / Eclipse
+.idea/
+*.iml
+.classpath
+.project
+.settings/
+
+# Application properties (clés API !)
+src/main/resources/application.properties
+
+# Logs
+*.log
