@@ -1,6 +1,9 @@
 package com.TeslaProject.TeslaProject.controller;
 
 import com.TeslaProject.TeslaProject.Services.GeminiService;
+import com.TeslaProject.TeslaProject.Services.OTPService;
+import com.TeslaProject.TeslaProject.models.Client;
+import com.TeslaProject.TeslaProject.repository.ClientRepository;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.util.LinkedMultiValueMap;
@@ -11,6 +14,7 @@ import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Map;
+import java.util.Optional;
 
 @RestController
 @RequestMapping("/api/public")
@@ -18,6 +22,8 @@ import java.util.Map;
 public class CarteGriseAuthController {
 
     private final GeminiService geminiService;
+    private final OTPService otpService;
+    private final ClientRepository clientRepository;
     private final RestTemplate restTemplate = new RestTemplate();
 
     @Value("${keycloak.auth-server-url}")
@@ -26,134 +32,129 @@ public class CarteGriseAuthController {
     @Value("${keycloak.realm}")
     private String realm;
 
-    public CarteGriseAuthController(GeminiService geminiService) {
+    public CarteGriseAuthController(GeminiService geminiService, OTPService otpService, ClientRepository clientRepository) {
         this.geminiService = geminiService;
+        this.otpService = otpService;
+        this.clientRepository = clientRepository;
     }
 
     @PostMapping("/login-carte-grise")
-    public ResponseEntity<?> loginWithCarteGrise(
-            @RequestParam("image") MultipartFile file) {
+    public ResponseEntity<?> loginWithCarteGrise(@RequestParam("image") MultipartFile file) {
         try {
-            // ① Analyser avec Gemini
+            // ① ANALYSE OCR (Ton code original)
             System.out.println("=== Analyse carte grise ===");
             String geminiResult = geminiService.analyzeImage(file);
             System.out.println("Résultat Gemini brut : " + geminiResult);
 
-            // ② Extraire matricule et châssis
             String matriculeBrut = extractValue(geminiResult, "immatriculation");
             String chassis       = extractValue(geminiResult, "châssis").trim();
-
-            System.out.println("Matricule brut  : " + matriculeBrut);
-            System.out.println("Châssis         : " + chassis);
-
-            // ③ Normaliser le matricule
-            String matricule = normaliserMatricule(matriculeBrut);
-            System.out.println("Matricule final : " + matricule);
+            String matricule     = normaliserMatricule(matriculeBrut);
 
             if (matricule.equals("nonlisible") || chassis.equalsIgnoreCase("Non lisible")) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "error", "Impossible de lire la carte grise. Réessayez avec une meilleure photo."
+                return ResponseEntity.badRequest().body(Map.of("success", false, "error", "Lecture impossible."));
+            }
+
+            // ② LOGIN KEYCLOAK (Ton code original qui marche)
+            System.out.println("Tentative Login Keycloak pour : " + matricule);
+            String token = getKeycloakToken(matricule, chassis);
+            System.out.println("✅ Token Keycloak récupéré");
+
+            // ③ RECHERCHE MONGODB (Ajout sécurisé)
+            // On utilise un try/catch ici pour que si MongoDB est en panne, le login ne crash pas totalement
+            try {
+                Optional<Client> clientOpt = clientRepository.findByMatricule(matricule);
+                if (clientOpt.isPresent()) {
+                    Client client = clientOpt.get();
+                    return ResponseEntity.ok(Map.of(
+                            "success", true,
+                            "token", token,
+                            "matricule", matricule,
+                            "email", maskEmail(client.getEmail()),
+                            "phone", maskPhone(client.getPhoneNumber()),
+                            "requireOTP", true
+                    ));
+                }
+            } catch (Exception mongoEx) {
+                System.err.println("⚠️ Erreur MongoDB : " + mongoEx.getMessage());
+                // Si MongoDB crash, on renvoie quand même le token mais avec un warning
+                return ResponseEntity.ok(Map.of(
+                        "success", true,
+                        "token", token,
+                        "warning", "Profil non trouvé dans MongoDB (Vérifiez votre connexion Atlas)"
                 ));
             }
 
-            // ④ Login Keycloak
-            String token = getKeycloakToken(matricule, chassis);
-
-            return ResponseEntity.ok(Map.of(
-                    "success",   true,
-                    "matricule", matricule,
-                    "chassis",   chassis,
-                    "token",     token
-            ));
+            return ResponseEntity.ok(Map.of("success", true, "token", token, "matricule", matricule));
 
         } catch (HttpClientErrorException.Unauthorized e) {
-            System.err.println("=== 401 Keycloak : user non trouvé ===");
-            return ResponseEntity.status(401).body(Map.of(
-                    "success", false,
-                    "error", "Véhicule non reconnu. Votre carte grise n'est pas enregistrée dans le système."
-            ));
+            return ResponseEntity.status(401).body(Map.of("success", false, "error", "Véhicule non reconnu ou châssis incorrect."));
         } catch (Exception e) {
-            System.err.println("=== ERREUR : " + e.getMessage());
-            return ResponseEntity.internalServerError().body(Map.of(
-                    "success", false,
-                    "error", e.getMessage()
-            ));
+            System.err.println("=== ERREUR GÉNÉRALE : " + e.getMessage());
+            return ResponseEntity.internalServerError().body(Map.of("success", false, "error", e.getMessage()));
         }
     }
 
-    private String normaliserMatricule(String matriculeBrut) {
-        if (matriculeBrut == null || matriculeBrut.isBlank()) return "nonlisible";
-
-        String result = matriculeBrut
-                .toLowerCase()
-                .trim()
-                // ✅ Gouvernorats en arabe → abréviation
-                .replace("تونس",    "tu")
-
-                // ✅ Gouvernorats en français → abréviation
-                .replace("tunis",      "tu")
-
-                // ✅ Supprimer espaces, tirets, underscores
-                .replaceAll("[\\s\\-_]+", "")
-                .trim();
-
-        // ✅ Réordonner si format inversé : "765tu190" → "190tu765"
-        // Format tunisien : NUMERO + GOUVERNORAT + NUMERO
-        // Gemini retourne parfois : 765 تونس 190 (inversé)
-        result = reordonnerMatricule(result);
-
-        System.out.println("Matricule après normalisation : " + result);
-        return result;
+    @PostMapping("/send-otp")
+    public ResponseEntity<?> sendOtp(@RequestBody Map<String, String> body) {
+        String matricule = body.get("matricule");
+        String method = body.getOrDefault("method", "email");
+        try {
+            Optional<Client> clientOpt = clientRepository.findByMatricule(matricule);
+            if (clientOpt.isEmpty()) return ResponseEntity.badRequest().body(Map.of("success", false, "error", "Profil non trouvé"));
+            Client client = clientOpt.get();
+            String otp = otpService.generateAndSaveOTP(matricule);
+            if ("sms".equalsIgnoreCase(method)) otpService.sendOTPSMS(client.getPhoneNumber(), otp);
+            else otpService.sendOTPEmail(client.getEmail(), otp);
+            return ResponseEntity.ok(Map.of("success", true));
+        } catch (Exception e) {
+            System.err.println("Erreur send-otp : " + e.getMessage());
+            return ResponseEntity.internalServerError().body(Map.of("success", false, "error", e.getMessage()));
+        }
     }
 
-    // ✅ Réordonne le matricule si Gemini l'a retourné dans l'ordre arabe (droite à gauche)
-// "765tu190" → "190tu765"
+    @PostMapping("/verify-otp")
+    public ResponseEntity<?> verifyOtp(@RequestBody Map<String, String> body) {
+        String matricule = body.get("matricule");
+        String code = body.get("code");
+        try {
+            boolean ok = otpService.verifyOTP(matricule, code);
+            if (ok) return ResponseEntity.ok(Map.of("success", true));
+            return ResponseEntity.status(400).body(Map.of("success", false, "error", "Code invalide ou expiré"));
+        } catch (Exception e) {
+            System.err.println("Erreur verify-otp : " + e.getMessage());
+            return ResponseEntity.internalServerError().body(Map.of("success", false, "error", e.getMessage()));
+        }
+    }
+
+    // --- Garde tes méthodes privées exactement comme avant ---
+    private String normaliserMatricule(String matriculeBrut) {
+        if (matriculeBrut == null || matriculeBrut.isBlank()) return "nonlisible";
+        String result = matriculeBrut.toLowerCase().trim().replace("تونس", "tu").replace("tunis", "tu").replaceAll("[\\s\\-_]+", "");
+        return reordonnerMatricule(result);
+    }
+
     private String reordonnerMatricule(String matricule) {
-        // Cherche le pattern : chiffres + lettres + chiffres
-        java.util.regex.Pattern pattern = java.util.regex.Pattern
-                .compile("^(\\d+)([a-z]+)(\\d+)$");
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("^(\\d+)([a-z]+)(\\d+)$");
         java.util.regex.Matcher matcher = pattern.matcher(matricule);
-
         if (matcher.matches()) {
-            String num1 = matcher.group(1); // 765
-            String gov  = matcher.group(2); // tu
-            String num2 = matcher.group(3); // 190
-
-            // Format standard tunisien : le plus petit numéro vient en premier
-            // OU on détecte l'ordre arabe (RTL) en inversant
-            int n1 = Integer.parseInt(num1);
-            int n2 = Integer.parseInt(num2);
-
-            // Si num1 > num2, c'est probablement inversé (ordre arabe RTL)
-            if (n1 > n2) {
-                String corrected = num2 + gov + num1;
-                System.out.println("Matricule réordonné : " + matricule + " → " + corrected);
-                return corrected;
-            }
+            int n1 = Integer.parseInt(matcher.group(1));
+            int n2 = Integer.parseInt(matcher.group(3));
+            if (n1 > n2) return matcher.group(3) + matcher.group(2) + matcher.group(1);
         }
         return matricule;
     }
 
     private String getKeycloakToken(String username, String password) {
-        String url = keycloakUrl + "/realms/" + realm
-                + "/protocol/openid-connect/token";
-
+        String url = keycloakUrl + "/realms/" + realm + "/protocol/openid-connect/token";
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
-
         MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
         body.add("grant_type", "password");
-        body.add("client_id",  "angular-app");
-        body.add("username",   username);
-        body.add("password",   password);
-
-        HttpEntity<MultiValueMap<String, String>> request =
-                new HttpEntity<>(body, headers);
-
-        ResponseEntity<Map> response = restTemplate.postForEntity(
-                url, request, Map.class);
-
+        body.add("client_id", "angular-app");
+        body.add("username", username);
+        body.add("password", password);
+        HttpEntity<MultiValueMap<String, String>> request = new HttpEntity<>(body, headers);
+        ResponseEntity<Map> response = restTemplate.postForEntity(url, request, Map.class);
         return (String) response.getBody().get("access_token");
     }
 
@@ -161,11 +162,12 @@ public class CarteGriseAuthController {
         for (String line : text.split("\n")) {
             if (line.toLowerCase().contains(key.toLowerCase())) {
                 String[] parts = line.split(":");
-                if (parts.length > 1) {
-                    return parts[parts.length - 1].trim();
-                }
+                if (parts.length > 1) return parts[parts.length - 1].trim();
             }
         }
         return "Non lisible";
     }
+
+    private String maskEmail(String email) { return email.replaceAll("(^.{3})(.*)(@.*)", "$1***$3"); }
+    private String maskPhone(String phone) { return phone.substring(0, 4) + "****" + phone.substring(phone.length() - 2); }
 }

@@ -5,6 +5,69 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.*;
+
+@Service
+public class GeminiService {
+
+    @Value("${gemini.api.key}")
+    private String apiKey;
+
+    // On utilise directement l'URL complète configurée dans properties
+    @Value("${gemini.api.url}")
+    private String apiUrl;
+
+    private final RestTemplate restTemplate = new RestTemplate();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    public String analyzeImage(MultipartFile imageFile) throws Exception {
+        String base64Image = Base64.getEncoder().encodeToString(imageFile.getBytes());
+        String mimeType = imageFile.getContentType() != null ? imageFile.getContentType() : "image/jpeg";
+
+        // Modèle actuel en 2026 (Remplace le 1.5-flash qui est 404)
+        String modelName = "gemini-3-flash-preview";
+
+        // Construction de l'URL : models/ + nom du modèle + :generateContent
+        String fullUrl = apiUrl + modelName + ":generateContent?key=" + apiKey;
+
+        try {
+            Map<String, Object> requestBody = new HashMap<>();
+            String prompt = "Analyse cette carte grise tunisienne. Extrait l'immatriculation (ex: 190tu765) et le numéro de châssis. " +
+                    "Réponds exactement comme ceci :\n" +
+                    "immatriculation: [valeur]\n" +
+                    "châssis: [valeur]";
+
+            requestBody.put("contents", List.of(Map.of(
+                    "parts", List.of(
+                            Map.of("text", prompt),
+                            Map.of("inline_data", Map.of("mime_type", mimeType, "data", base64Image))
+                    )
+            )));
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+
+            HttpEntity<Map<String, Object>> entity = new HttpEntity<>(requestBody, headers);
+            ResponseEntity<String> response = restTemplate.postForEntity(fullUrl, entity, String.class);
+
+            JsonNode root = objectMapper.readTree(response.getBody());
+            return root.path("candidates").get(0).path("content").path("parts").get(0).path("text").asText();
+
+        } catch (Exception e) {
+            System.err.println("Détail Erreur : " + e.getMessage());
+            throw new RuntimeException("L'analyse a échoué. Modèle utilisé : " + modelName);
+        }
+    }
+}/*package com.TeslaProject.TeslaProject.Services;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.*;
+import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
@@ -108,4 +171,4 @@ public class GeminiService {
                 .path("text")
                 .asText("Analyse non disponible");
     }
-}
+}*/
