@@ -14,8 +14,8 @@ import java.util.List;
 import java.util.Map;
 
 @RestController
-@RequestMapping("/api/gemini")
-@CrossOrigin(origins = "http://localhost:4200")
+@RequestMapping("/api/public/gemini")
+@CrossOrigin(origins = {"http://localhost:4200", "http://localhost:4201", "http://localhost:4202", "http://localhost:51455"})
 public class GeminiController {
 
     private final GeminiService geminiService;
@@ -77,4 +77,5 @@ public class GeminiController {
     public ResponseEntity<List<ImageAnalysisResult>> getHistory() {
         return ResponseEntity.ok(repository.findAll());
     }
+
 }
